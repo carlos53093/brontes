@@ -1,0 +1,184 @@
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches: [main]
+
+name: CI
+
+jobs:
+  clippy:
+    name: "clippy"
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy,rustfmt
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: "clippy-nightly"
+
+      - run: git config --global url."https://x-access-token:${{ secrets.CI }}@github.com/".insteadOf "https://github.com/"
+        shell: bash
+      - run: git config --global url."https://${{ secrets.CI }}@github.com/".insteadOf "git@github.com:"
+        shell: bash
+
+      - name: "clippy all"
+        run: cargo clippy --workspace --lib --examples --tests --benches --all-features
+        env:
+          RUSTFLAGS: -D warnings
+
+  build:
+    name: "build and fmt"
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy,rustfmt
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: "buildfmt-nightly"
+          cache-on-failure: true
+
+      # allow for downloads
+      - run: git config --global url."https://x-access-token:${{ secrets.CI }}@github.com/".insteadOf "https://github.com/"
+        shell: bash
+      - run: git config --global url."https://${{ secrets.CI }}@github.com/".insteadOf "git@github.com:"
+        shell: bash
+
+      - name: "build nightly"
+        run: cargo build --workspace --all-features
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: "cargo fmt"
+        run: cargo fmt --all --check
+
+  test:
+    runs-on: ubuntu-latest
+    if: always() && !cancelled() && !contains(needs.*.result, 'failure') && github.event.pull_request.draft == false
+    needs: [clippy, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["sorella-server"]
+    steps:
+      - name: Get branch names.
+        id: branch-names
+        uses: tj-actions/branch-names@v8
+      - name: Init ssh config
+        run: |
+          mkdir ~/.ssh/ 
+          echo "${{ secrets.BASTION_SSH }}" > ~/.ssh/bastion 
+          chmod 600 ~/.ssh/bastion 
+          echo "${{ secrets.BRONTES_SSH }}" > ~/.ssh/brontes_server 
+          chmod 600 ~/.ssh/brontes_server
+          echo "${{ secrets.SSH_CONFIG }}" > ~/.ssh/config
+
+      - name: cargo test
+        id: run_tests
+        continue-on-error: true
+        run: |
+          ssh brontes_server -tt "bash --login -c '
+            source ~/.bashrc
+            cd \$HOME
+            mkdir -p ${{ steps.branch-names.outputs.current_branch }}-test-${{ matrix.features }}
+            cd ${{ steps.branch-names.outputs.current_branch }}-test-${{ matrix.features }}
+            git clone https://github.com/SorellaLabs/brontes.git
+            cd brontes
+            git checkout ${{ steps.branch-names.outputs.current_branch }}
+            ./scripts/run-tests.sh ${{ steps.branch-names.outputs.current_branch }} ${{ steps.branch-names.outputs.current_branch }}-test-${{ matrix.features }} test ${{ matrix.features }}
+          '"
+      - name: Cleanup
+        if: always()
+        run: |
+          ssh brontes_server -tt "bash --login -c '
+            set -x
+            rm -rf \$HOME/${{ steps.branch-names.outputs.current_branch }}-test-${{ matrix.features }}
+            rm -rf /home/brontes-ci/data/${{ steps.branch-names.outputs.current_branch }}-test-${{ matrix.features }}
+          '"
+
+      - name: Check test result
+        if: steps.run_tests.outcome == 'failure'
+        run: exit 1
+
+  it-test:
+    runs-on: ubuntu-latest
+    if: always() && !cancelled() && !contains(needs.*.result, 'failure') && github.event.pull_request.draft == false
+    needs: [clippy, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["sorella-server"]
+    steps:
+      - name: Get branch names.
+        id: branch-names
+        uses: tj-actions/branch-names@v8
+      - name: Init ssh config
+        run: |
+          mkdir ~/.ssh/ 
+          echo "${{ secrets.BASTION_SSH }}" > ~/.ssh/bastion 
+          chmod 600 ~/.ssh/bastion 
+          echo "${{ secrets.BRONTES_SSH }}" > ~/.ssh/brontes_server 
+          chmod 600 ~/.ssh/brontes_server
+          echo "${{ secrets.SSH_CONFIG }}" > ~/.ssh/config
+
+      - name: cargo it test
+        id: run_it_tests
+        continue-on-error: true
+        run: |
+          ssh brontes_server -tt "bash --login -c '
+            source ~/.bashrc
+            cd \$HOME
+            mkdir -p ${{ steps.branch-names.outputs.current_branch }}-it-${{ matrix.features }}
+            cd ${{ steps.branch-names.outputs.current_branch }}-it-${{ matrix.features }}
+            git clone https://github.com/SorellaLabs/brontes.git
+            cd brontes
+            git checkout ${{ steps.branch-names.outputs.current_branch }}
+            ./scripts/run-tests.sh ${{ steps.branch-names.outputs.current_branch }} ${{ steps.branch-names.outputs.current_branch }}-it-${{ matrix.features }} it ${{ matrix.features }}
+          '"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          ssh brontes_server -tt "bash --login -c '
+            set -x
+            rm -rf \$HOME/${{ steps.branch-names.outputs.current_branch }}-it-${{ matrix.features }}
+            rm -rf /home/brontes-ci/data/${{ steps.branch-names.outputs.current_branch }}-it-${{ matrix.features }}
+          '"
+
+      - name: Check integration test result
+        if: steps.run_it_tests.outcome == 'failure'
+        run: exit 1
+
+  cleanup:
+    name: "Cleanup"
+    needs: [test, it-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Init ssh config
+        run: |
+          mkdir ~/.ssh/ 
+          echo "${{ secrets.BASTION_SSH }}" > ~/.ssh/bastion 
+          chmod 600 ~/.ssh/bastion 
+          echo "${{ secrets.BRONTES_SSH }}" > ~/.ssh/brontes_server 
+          chmod 600 ~/.ssh/brontes_server
+          echo "${{ secrets.SSH_CONFIG }}" > ~/.ssh/config
+
+      - name: Run cleanup
+        run: |
+          ssh brontes_server -tt "bash --login -c '
+            set -x
+            rm -rf \$HOME/*/
+            echo \"Cleanup completed\"
+          '"
